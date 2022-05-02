@@ -1,0 +1,189 @@
+---
+title: "align-1.0"
+author: "Kai McNamee"
+date: "4/8/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(leaflet)
+library(tidycensus)
+library(sp)
+library(sf)
+library(rgdal)
+library(geojsonio)
+library(jsonlite)
+library(httr)
+library(foreign)
+library(janitor)
+library(geosphere)
+library(stargazer)
+library(areal)
+library(osmdata)
+```
+
+```{r prep-areal}
+i105 <- readRDS("i105.RDS")
+i105_ramps <- readRDS("i105_ramps.RDS")
+
+# reproject cleaned data (epsg = 4326) to mercator (epsg = 3857) for areal
+# interpolation function to work
+
+# read and clean census data
+
+c1990 <- readRDS("c1990_bg_out.RDS") %>% 
+  rename(geoid.1990 = geoid) %>% 
+  filter(str_detect(str_sub(geoid.1990, 1, 5), "06037")) %>% 
+  st_transform(3857)
+
+c2000 <- readRDS("c2000_bg_out.RDS") %>% 
+  rename(geoid.2000 = geoid) %>% 
+  st_transform(3857)
+
+# sum ages into young (0-19) and old (65+). combine race counts to be
+# consistent between 1990 and 2000 (1990 combines Asian/Pacific Islander, 2000
+# separates Asian and Pacific Islander. sum tenure variables for Hispanic
+# householders (owner/renter occupied units are divided into racial groups for
+# householders of Hispanic descent in 1990)
+
+c1990_young_cols <- names(c1990)[12:25]
+c1990$young <- rowSums(c1990 %>%
+                         st_drop_geometry() %>%
+                         select(all_of(c1990_young_cols)))
+
+c1990_old_cols <- names(c1990)[26:30]
+c1990$old <- rowSums(c1990 %>%
+                       st_drop_geometry() %>%
+                       select(all_of(c1990_old_cols)))
+
+c1990$hispanic_owner_occupied <- rowSums(c1990 %>% 
+                                           st_drop_geometry() %>% 
+                                           select(white_hispanic_owner,
+                                                  black_hispanic_owner,
+                                                  native_hispanic_owner,
+                                                  asian_hispanic_owner,
+                                                  other_hispanic_owner))
+
+c1990$hispanic_renter_occupied <- rowSums(c1990 %>% 
+                                           st_drop_geometry() %>% 
+                                           select(white_hispanic_renter,
+                                                  black_hispanic_renter,
+                                                  native_hispanic_renter,
+                                                  asian_hispanic_renter,
+                                                  other_hispanic_renter))
+
+c1990 <- c1990 %>% 
+  select(-c(all_of(c(c1990_young_cols, c1990_old_cols)), white_hispanic_owner,
+            black_hispanic_owner, native_hispanic_owner, asian_hispanic_owner, 
+            other_hispanic_owner, white_hispanic_renter, black_hispanic_renter,
+            native_hispanic_renter, asian_hispanic_renter, other_hispanic_renter)) %>% 
+  relocate(c("young", "old"), .after = "population")
+
+c2000_young_cols <- c("male_under_5", "male_5_9", "male_10_14", "male_15_17", 
+                      "male_18_19", "female_under_5", "female_5_9", 
+                      "female_10_14", "female_15_17", "female_18_19")
+
+c2000$young <- rowSums(c2000 %>%
+                         st_drop_geometry() %>%
+                         select(all_of(c2000_young_cols)))
+
+c2000_old_cols <- c("male_65_66", "male_67_69", "male_70_74", "male_75_79", 
+                    "male_80_84", "male_85", "female_65_66", "female_67_69", 
+                    "female_70_74", "female_75_79", "female_80_84", "female_85")
+c2000$old <- rowSums(c2000 %>%
+                       st_drop_geometry() %>%
+                       select(all_of(c2000_old_cols)))
+
+c2000 <- c2000 %>% 
+  mutate(asian_householder = asian_householder + hi_pi_householder,
+         asian_owner_occupied = asian_owner_occupied + hi_pi_owner_occupied,
+         asian_renter_occupied = asian_renter_occupied + hi_pi_renter_occupied) %>% 
+  select(-all_of(c(c2000_young_cols, c2000_old_cols, "hi_pi_householder", 
+                   "hi_pi_owner_occupied", "hi_pi_renter_occupied"))) %>% 
+  relocate(c("young", "old"), .after = "population")
+```
+
+
+```{r full-areal-interpolation, eval=FALSE}
+# use ar_interpolate to interpolate 1990 census data into 2000 geographic
+# boundaries. join the data such that each observation corresponds to 1 census
+# block group, and each variable measures one characteristic in each year (ie.
+# population.1990 vs. population.20000)
+
+# note: target layer for interpolation can't have same variables as source layer
+
+c2000_target <- c2000 %>% 
+  select(geoid.2000, geometry)
+
+# NOTE: population count variables are spatially extensive, housing summary
+# variables (median value/rent) are spatially intensive
+
+ar_extensive <- names(c1990) %>% 
+  setdiff(c("geoid.1990", "distance", "median_value", "median_rent", "geometry"))
+
+ar_intensive <- c("median_value", "median_rent")
+
+ar_validate(c1990, c2000_target, varList = c(ar_extensive, ar_intensive),
+            method = "aw", verbose = T)
+
+areal <- aw_interpolate(c2000_target, tid = geoid.2000, 
+                        source = c1990, sid = geoid.1990,
+                        weight = "sum", output = "sf",
+                        extensive = ar_extensive, intensive = ar_intensive)
+
+# clean interopolated 1990 data
+
+names(areal)[3:ncol(areal)] <- str_c(names(areal)[3:ncol(areal)], ".1990")
+
+areal_clean <- areal %>% 
+  mutate_if(is.numeric, round, 0) %>%
+  distinct() %>%
+  st_transform(4326) %>% 
+  left_join(c2000 %>% 
+              st_drop_geometry %>% 
+              select(geoid.2000, distance, distance_shoreline, off_east, 
+                     off_west, on_east, on_west), 
+            by = "geoid.2000")
+
+c1990_order <- c("geoid.2000", "distance", "distance_shoreline", "off_east", 
+                 "off_west", "on_east", "on_west", 
+                 str_c(names(c1990)[3:(ncol(c1990) - 1)], ".1990"))
+
+areal_clean <- areal_clean[, c1990_order]
+```
+
+```{r save}
+saveRDS(areal_clean, "c1990_interpolated.RDS")
+saveRDS(c2000, "c2000_clean.RDS")
+```
+
+```{r check}
+# map interpolated data to confirm join worked
+
+c1990_interpolated <- readRDS("c1990_interpolated.RDS")
+
+leaflet() %>% 
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addPolygons(data = c1990_interpolated %>% filter(as.numeric(distance) < 3218.69 * 2),
+              weight = 0.5,
+              popup = ~ paste(geoid.2000,
+                              "</br> 1990 pop:", population.1990,
+                              "</br> shoreline: ", distance_shoreline,
+                              "</br> on west: ", on_west)) %>%
+  addPolylines(data = i105, weight = 3, color = "black") %>% 
+  addCircleMarkers(data = i105_ramps, weight = 3, radius = 1,  color = "black")
+```
+
+```{r example-ar-bounds}
+c2000_4326 <- c2000 %>% st_transform(4326) %>% filter(as.numeric(distance) < 3218.69 * 2)
+c1990_4326 <- c1990 %>% st_transform(4326) %>% filter(as.numeric(distance) < 3218.69 * 2)
+
+leaflet() %>% 
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addPolygons(data = c1990_4326, weight = 1) %>% 
+  addPolylines(data = c2000_4326, weight = 2, color = "red", fillColor = NA)
+```
+
+

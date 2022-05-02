@@ -1,0 +1,813 @@
+---
+title: "models-1.0"
+author: "Kai McNamee"
+date: "4/13/2022"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(sp)
+library(sf)
+library(rgdal)
+library(leaflet)
+library(janitor)
+library(stargazer)
+library(RColorBrewer)
+mile <- 1609.34
+prop_change <- function(x1, x2){
+  (x2 - x1) / x1 
+}
+```
+
+```{r read}
+# read interpolated 1990 data and 2000 data
+
+c1990_interpolated <- readRDS("c1990_interpolated.RDS") %>% 
+  select(-hispanic_householder.1990) 
+
+c2000 <- readRDS("c2000_clean.RDS")
+names(c2000)[9:ncol(c2000)] <- str_c(names(c2000)[9:ncol(c2000)], ".2000")
+
+cjoined <- c1990_interpolated %>% 
+  left_join(c2000 %>% st_drop_geometry(), 
+            by = c("geoid.2000", "distance", "distance_shoreline", "off_east", 
+                   "off_west", "on_east", "on_west")) %>% 
+  distinct()
+```
+
+```{r county-trends}
+# normalize count data by totals (ex: white population / total population)
+
+pop_vars.1990 <- names(cjoined)[str_detect(names(cjoined), ".1990") &
+                             !str_detect(names(cjoined), "median|householder|occupied|population")]
+
+tenure_vars.1990 <- names(cjoined)[str_detect(names(cjoined), ".1990") &
+                                     !str_detect(names(cjoined), paste(pop_vars.1990, collapse = "|")) &
+                                     !str_detect(names(cjoined), "occupied_units|median|population")]
+
+pop_vars.2000 <- names(cjoined)[str_detect(names(cjoined), ".2000") &
+                             !str_detect(names(cjoined), "geoid|median|householder|occupied|population")]
+
+tenure_vars.2000 <- names(cjoined)[str_detect(names(cjoined), ".2000") &
+                                     !str_detect(names(cjoined), paste(pop_vars.2000, collapse = "|")) &
+                                     !str_detect(names(cjoined), "geoid|occupied_units|median|population")]
+
+county <- cjoined %>%
+  st_drop_geometry() %>% 
+  mutate(across(.cols = pop_vars.1990, ~./population.1990),
+         across(.cols = tenure_vars.1990, ~./occupied_units.1990),
+         across(.cols = pop_vars.2000, ~./population.2000),
+         across(.cols = tenure_vars.2000, ~./occupied_units.2000),
+         across(.cols = c(distance, distance_shoreline, off_east, off_west, 
+                          on_east, on_west), ~as.numeric(.))) 
+
+# visualize county level trends
+
+# median home value across LA county in 1990 and 2000
+
+county %>% 
+  select(distance, median_value.1990, median_value.2000) %>% 
+  filter(if_all(.cols = c(median_value.1990, median_value.2000), ~ . > 0)) %>% 
+  pivot_longer(cols = c(median_value.1990, median_value.2000), 
+               names_to = "year", values_to = "median_value") %>% 
+  ggplot(aes(x = median_value, fill = year)) +
+    geom_histogram(bins = 100, position = "identity", alpha = 0.75) +
+    theme_light() +
+    labs(x = "Median value",
+         y = "Count",
+         title = "Median block group home value in LA county")
+
+# median home value within 2 miles of i105 in 1990 and 2000
+
+county %>%
+  select(distance, median_value.1990, median_value.2000) %>% 
+  filter(if_all(.cols = c(median_value.1990, median_value.2000), ~ . > 0), 
+         distance < mile * 2) %>% 
+  pivot_longer(cols = median_value.1990:median_value.2000, names_to = "year", 
+               values_to = "median_value") %>% 
+  ggplot(aes(x = median_value, fill = year)) +
+    geom_histogram(bins = 100, position = "identity", alpha = 0.75) +
+    theme_light() +
+    labs(x = "Median value",
+         y = "Count",
+         title = "Median block group home value within 2 miles of i105")
+
+# percent white population by block group across LA county in 1990 and 2000 
+
+county %>%
+  select(distance, white.1990, white.2000) %>% 
+  drop_na() %>% 
+  pivot_longer(cols = white.1990:white.2000, names_to = "year", 
+               values_to = "percent_white") %>% 
+  ggplot(aes(x = percent_white, fill = year)) +
+    geom_histogram(bins = 100, position = "identity", alpha = 0.75) +
+    theme_light() +
+    labs(x = "Percent White",
+         y = "Count",
+         title = "Percent white population by block group across LA county")
+
+# percent white population by block group within 2 mi of i105 in 1990 and 2000 
+
+county %>%
+  select(distance, white.1990, white.2000) %>% 
+  drop_na() %>% 
+  pivot_longer(cols = white.1990:white.2000, names_to = "year", 
+               values_to = "percent_white") %>% 
+  filter(distance < mile * 2) %>% 
+  ggplot(aes(x = percent_white, fill = year)) +
+    geom_histogram(bins = 100, position = "identity", alpha = 0.75) +
+    theme_light() +
+    labs(x = "Percent White",
+         y = "Count",
+         title = "Percent white population by block group within 2 miles of i105")
+```
+
+
+```{r h-viz-scatterplots}
+# visualize relationships between housing outcome variables and distance to i105
+
+mile <- 1609.34
+cutoff <- 2
+
+hviz_1 <- county %>% 
+  select(geoid.2000, distance, median_value.1990, median_value.2000, 
+         median_rent.1990, median_rent.2000) %>%
+  mutate(distance = as.numeric(distance)) %>% 
+  filter_all(all_vars(. > 0))
+
+# median value/rent ~ distance
+
+hviz_1 %>% 
+  pivot_longer(median_value.1990:median_rent.2000, 
+               names_to = "series", values_to = "values") %>% 
+  filter(series == "median_value.1990" | series == "median_value.2000",
+         distance < mile * cutoff) %>%
+  ggplot(aes(x = distance, y = values, color = series)) +
+    geom_point(alpha = 0.5, size = 0.5) +
+    geom_smooth(method = "loess", formula = y ~ x) +
+    # geom_vline(xintercept = 3500, lty = "dashed") +
+    theme_light() +
+    labs(title = str_c("Median home value ~ distance \n(cutoff = ", cutoff, 
+                       " mile)"))
+
+hviz_1 %>% 
+  pivot_longer(median_value.1990:median_rent.2000, 
+               names_to = "series", values_to = "values") %>% 
+  filter(series == "median_rent.1990" | series == "median_rent.2000",
+         distance < mile * cutoff) %>%
+  ggplot(aes(x = distance, y = values, color = series)) +
+    geom_point(alpha = 0.5, size = 0.5) +
+    geom_smooth(method = "loess", formula = y ~ x) +
+    theme_light() +
+    labs(title = str_c("Median rent ~ distance \n(cutoff = ", cutoff, 
+                       " mile)"))
+```
+
+```{r h-viz-loess}
+# use local polynomial regression to identify trends in value vs. distance
+# gradient -- weight census block groups by total occupied units
+
+mile <- 1609.34
+cutoff <- 2
+
+hviz_loess <- county %>% 
+  select(geoid.2000, distance, 
+         median_value.1990, median_value.2000, 
+         occupied_units.1990, occupied_units.2000,
+         population.1990, population.2000) %>%
+  filter(if_all(.cols = median_value.1990:population.2000, ~ . > 0)) 
+
+# lpr median value 1990 ~ distance to i105 weighted by total occupied units
+
+hlpr_1990 <- hviz_loess %>% 
+  pivot_longer(cols = median_value.1990:median_value.2000, names_to = "series", 
+               values_to = "values") %>% 
+  filter(series == "median_value.1990" & distance < mile * cutoff) %>% 
+  loess(data = ., formula = values ~ distance, weights = occupied_units.1990,
+        span = 0.75)
+
+hlpr_preds_1990 <- predict(hlpr_1990, 
+                           hviz_loess$distance[hviz_loess$distance < mile * cutoff], 
+                           se = T) %>% 
+  as_tibble() %>% 
+  mutate(distance = hviz_loess$distance[hviz_loess$distance < mile * cutoff],
+         year = "1990")
+  
+# lpr median value 2000 ~ distance to i105 weighted by total occupied units 
+
+hlpr_2000 <- hviz_loess %>% 
+  pivot_longer(cols = median_value.1990:median_value.2000, names_to = "series", 
+               values_to = "values") %>% 
+  filter(series == "median_value.2000" & distance < mile * cutoff) %>% 
+  loess(data = ., formula = values ~ distance, weights = occupied_units.2000,
+        span = 0.75)
+
+hlpr_preds_2000 <- predict(hlpr_2000, 
+                           hviz_loess$distance[hviz_loess$distance < mile * cutoff], 
+                           se = T) %>% 
+  as_tibble() %>% 
+  mutate(distance = hviz_loess$distance[hviz_loess$distance < mile * cutoff], 
+         year = "2000")
+
+# combine lpr predictions to plot median value 1990/2000 ~ distance to i105
+# weighted by occupied units
+
+hlpr_preds_1990 %>% 
+  select(fit, se.fit, year, distance) %>% 
+  rbind(hlpr_preds_2000 %>% select(fit, se.fit, year, distance)) %>% 
+  ggplot(aes(x = distance, color = year, fill = year)) +
+    geom_line(aes(y = fit)) +
+    geom_ribbon(aes(ymax = fit + (1.96 * se.fit), ymin = fit - (1.96 * se.fit)), 
+                alpha = 0.25, color = NA) +
+    theme_light() +
+    labs(x = "Distance", y = "Median home value", 
+         title = str_c("Loess: median value ~ distance (cutoff = ", cutoff, " mile)"))
+
+# lpr change in median value ~ distance for 1990 and 2000
+
+hlpr_preds_1990 %>% 
+  select(fit, se.fit, year, distance) %>% 
+  left_join(hlpr_preds_2000 %>% select(fit, se.fit, year, distance), 
+            by = "distance") %>% 
+  mutate(prop_change_value = prop_change(fit.x, fit.y),
+         prop_change_se = prop_change(se.fit.x, se.fit.y)) %>% 
+  ggplot(aes(x = distance)) +
+    geom_line(aes(y = prop_change_value)) +
+    geom_ribbon(aes(ymax = prop_change_value + (1.96 * prop_change_se), 
+                    ymin = prop_change_value - (1.96 * prop_change_se)), 
+                alpha = 0.25, color = NA) +
+    theme_light()
+```
+
+```{r r-viz-scatterplots}
+# visualize relationships between housing outcome variables and distance to
+# freeway ramps
+
+cutoff <- 2
+
+hviz_2 <- county %>% 
+  select(geoid.2000, on_east, off_east, on_west, off_west, median_value.1990, 
+         median_value.2000, median_rent.1990, median_rent.2000) %>% 
+  pivot_longer(cols = on_east:off_west, names_to = "series", values_to = "values") %>% 
+  mutate(series = ifelse(str_detect(series, "on"), "on", "off")) %>% 
+  group_by(geoid.2000, series) %>% 
+  arrange(values, .by_group = T) %>% 
+  slice(1) %>% 
+  mutate(values = as.numeric(values)) 
+
+# median value/rent ~ distance to freeway entrance
+
+hviz_2 %>% 
+  pivot_wider(names_from = series, values_from = values) %>% 
+  relocate(c(off, on), .after = geoid.2000) %>% 
+  pivot_longer(median_value.1990:median_rent.2000, 
+               names_to = "series", values_to = "values") %>% 
+  filter(str_detect(series, "median_value"),
+         on < mile * cutoff) %>% 
+  ggplot(aes(x = on, y = values, color = series)) +
+    geom_point(alpha = 0.5, size = 0.5) +
+    geom_smooth(method = "loess", formula = y ~ x) +
+    # geom_vline(xintercept = 3500, lty = "dashed") +
+    theme_light() +
+    labs(title = str_c("Median value ~ distance to freeway entrance (cutoff = ", 
+                       cutoff, " mile)"))
+
+hviz_2 %>% 
+  pivot_wider(names_from = series, values_from = values) %>% 
+  relocate(c(off, on), .after = geoid.2000) %>% 
+  pivot_longer(median_value.1990:median_rent.2000, 
+               names_to = "series", values_to = "values") %>% 
+  filter(str_detect(series, "median_rent"),
+         on < mile * cutoff) %>% 
+  ggplot(aes(x = on, y = values, color = series)) +
+    geom_point(alpha = 0.5, size = 0.5) +
+    geom_smooth(method = "loess", formula = y ~ x) +
+    theme_light() +
+    labs(title = str_c("Median rent ~ distance to freeway entrance (cutoff = ", 
+                       cutoff, " mile)"))
+
+# median value/rent ~ distance to freeway exit
+
+hviz_2 %>% 
+  pivot_wider(names_from = series, values_from = values) %>% 
+  relocate(c(off, on), .after = geoid.2000) %>% 
+  pivot_longer(median_value.1990:median_rent.2000, 
+               names_to = "series", values_to = "values") %>% 
+  filter(str_detect(series, "median_value"),
+         off < mile * cutoff) %>% 
+  ggplot(aes(x = off, y = values, color = series)) +
+    geom_point(alpha = 0.5, size = 0.5) +
+    geom_smooth(method = "loess", formula = y ~ x) +
+    theme_light() +
+    labs(title = str_c("Median value ~ distance to freeway exit (cutoff = ", 
+                       cutoff, " mile)"))
+
+hviz_2 %>% 
+  pivot_wider(names_from = series, values_from = values) %>% 
+  relocate(c(off, on), .after = geoid.2000) %>% 
+  pivot_longer(median_value.1990:median_rent.2000, 
+               names_to = "series", values_to = "values") %>% 
+  filter(str_detect(series, "median_rent"),
+         off < mile * cutoff) %>% 
+  ggplot(aes(x = off, y = values, color = series)) +
+    geom_point(alpha = 0.5, size = 0.5) +
+    geom_smooth(method = "loess", formula = y ~ x) +
+    theme_light() +
+    labs(title = str_c("Median rent ~ distance to freeway exit (cutoff = ", 
+                       cutoff, " mile)"))
+```
+```{r r-viz-loess}
+# use local polynomial regression to identify trends in value/distance gradient
+# using distance to nearest ramps -- weight census block groups by total
+# occupied units
+
+mile <- 1609.34
+cutoff <- 2
+
+rviz_loess <- county %>% 
+  select(geoid.2000, on_east, off_east, on_west, off_west, median_value.1990, 
+         median_value.2000, median_rent.1990, median_rent.2000, occupied_units.1990, 
+         occupied_units.2000) %>% 
+  pivot_longer(cols = on_east:off_west, names_to = "series", values_to = "distance") %>% 
+  mutate(series = ifelse(str_detect(series, "on"), "on", "off")) %>% 
+  group_by(geoid.2000, series) %>% 
+  arrange(distance, .by_group = T) %>% 
+  slice(1) %>% 
+  mutate(distance = as.numeric(distance)) %>% 
+  filter(if_all(.cols = c(median_value.1990:occupied_units.2000), ~ . > 0))
+
+# lpr median value 1990 ~ distance to nearest i105 on ramp weighted by total
+# occupied units
+
+rlpr_1990 <- rviz_loess %>% 
+  filter(series == "on" & distance < mile * cutoff) %>% 
+  loess(data = ., formula = median_value.1990 ~ distance, 
+        weights = occupied_units.1990,
+        span = 0.75)
+
+rlpr_preds_1990 <- predict(rlpr_1990, 
+                           rviz_loess$distance[rviz_loess$distance < mile * cutoff &
+                                                 rviz_loess$series == "on"],
+                           se = T) %>%  
+  as_tibble() %>% 
+  mutate(distance = rviz_loess$distance[rviz_loess$distance < mile * cutoff & 
+                                          rviz_loess$series == "on"], 
+         year = "1990")
+
+# lpr median value 2000 ~ distance to nearest i105 on ramp weighted by total
+# occupied units
+
+rlpr_2000 <- rviz_loess %>% 
+  filter(series == "on" & distance < mile * cutoff) %>% 
+  loess(data = ., formula = median_value.2000 ~ distance, 
+        weights = occupied_units.2000,
+        span = 0.75)
+
+rlpr_preds_2000 <- predict(rlpr_2000, 
+                           rviz_loess$distance[rviz_loess$distance < mile * cutoff &
+                                                 rviz_loess$series == "on"],
+                           se = T) %>%  
+  as_tibble() %>% 
+  mutate(distance = rviz_loess$distance[rviz_loess$distance < mile * cutoff & 
+                                          rviz_loess$series == "on"], 
+         year = "2000")
+
+# combine lpr predictions to plot median value 1990/2000 ~ distance to nearest
+# i105 on ramp
+
+rlpr_preds_joined <- rbind(rlpr_preds_1990, rlpr_preds_2000)
+
+rlpr_preds_joined %>% 
+  ggplot(aes(x = distance, color = year, fill = year)) +
+    geom_line(aes(y = fit)) +
+    geom_ribbon(aes(ymax = fit + (1.96 * se.fit), ymin = fit - (1.96 * se.fit)), 
+                alpha = 0.25, color = NA) +
+    theme_light() +
+    labs(x = "Distance", y = "Median home value", 
+         title = str_c("Loess: median value ~ distance to on (cutoff = ", 
+                       cutoff, " mile)"))
+
+# lpr percent change in  median value ~ distance to nearest on ramp
+
+rlpr_preds_1990 %>% 
+  select(fit, se.fit, distance, year) %>% 
+  left_join(rlpr_preds_2000 %>% 
+              select(fit, se.fit, distance, year), by = "distance") %>% 
+  mutate(prop_change_value = prop_change(fit.x, fit.y),
+         prop_change_se = prop_change(se.fit.x, se.fit.y)) %>% 
+  ggplot(aes(x = distance)) +
+  geom_line(aes(y = prop_change_value)) +
+    geom_ribbon(aes(ymax = prop_change_value + (1.96 * prop_change_se), 
+                    ymin = prop_change_value - (1.96 * prop_change_se)), 
+                alpha = 0.25, color = NA) +
+    theme_light()
+```
+
+```{r h-discontinuity}
+# plot median value ~ distance using discontinuity to test if there's a
+# definable "treatment" zone
+
+treatment_zone <- 1750
+cutoff <- 2
+
+hviz_disc <- hviz_1 %>% 
+  mutate(treatment = distance < treatment_zone) %>% 
+  select(distance, median_value.1990, median_value.2000, treatment) %>% 
+  pivot_longer(median_value.1990:median_value.2000, names_to = "series", 
+               values_to = "values")
+  
+ggplot() +
+  geom_smooth(data = hviz_disc %>% 
+                filter(distance < mile * cutoff, str_detect(series, "1990")),
+              aes(x = distance, y = values, group = treatment, color = series),
+              method = "lm", formula = y ~ x) +
+  geom_smooth(data = hviz_disc %>% 
+                  filter(distance < mile * cutoff, str_detect(series, "2000")),
+              aes(x = distance, y = values, group = treatment, color = series),
+              method = "lm", formula = y ~ x) +
+  geom_vline(xintercept = treatment_zone, lty = "dashed") +
+  facet_wrap("series") +
+  theme_light() +
+  labs(title = str_c("Median value ~ distance (cutoff = ", cutoff, " mile, treatment = ", treatment_zone, ")"))
+```
+
+```{r h-discontinuity-models}
+data_disc <- hviz_1 %>% 
+  mutate(treatment = distance < treatment_zone) %>% 
+  select(geoid.2000, distance, median_value.1990, median_value.2000, treatment) %>% 
+  filter(distance < mile * cutoff)
+  
+m_disc.2000 <-lm(median_value.2000 ~ distance + treatment + treatment:distance, 
+                 data = data_disc)
+m_disc.1990 <- lm(median_value.1990 ~ distance + treatment + treatment:distance, 
+                  data = data_disc)
+# summary(m_disc.1990)
+# summary(m_disc.2000)
+
+stargazer(m_disc.1990, m_disc.2000, type = "text")
+
+# notes: treatment is significant for both 1990 and 2000 data at 3000m, cutoff 5mi
+
+```
+
+```{r p-viz-scatterplots}
+# visualize relationships between population outcome variables and distance to
+# i105
+
+cutoff <- 2 
+
+# percent white population ~ distance to i105
+
+county %>% 
+  select(distance, white.1990, white.2000) %>% 
+  mutate(non_white.1990 = 1 - white.1990, 
+         non_white.2000 = 1 - white.2000,
+         change_non_white = prop_change(non_white.1990, non_white.2000)) %>%  
+  pivot_longer(cols = white.1990:non_white.2000, names_to = "series", 
+               values_to = "values") %>%
+  filter(series == "non_white.1990" | series == "non_white.2000",
+         distance < mile * cutoff) %>%
+  ggplot(aes(x = distance, y = values, color = series)) +
+    geom_point(size = 0.5, alpha = 0.5) +
+    geom_smooth(method = "loess", formula = y ~ x) +
+    theme_light() +
+    facet_wrap("series") +
+    labs(title = str_c("Non white ~ distance to freeway \n(cutoff = ", 
+                       cutoff, " mile)"))
+
+# percent change in white population ~ distance to i105
+
+county %>% 
+  select(distance, white.1990, white.2000) %>% 
+  mutate(non_white.1990 = 1 - white.1990, 
+         non_white.2000 = 1 - white.2000,
+         change_non_white = prop_change(non_white.1990, non_white.2000)) %>%  
+  filter(distance < mile * cutoff) %>% 
+  ggplot(aes(x = distance, y = change_non_white)) +
+    geom_point(size = 0.5, alpha = 0.5) +
+    geom_smooth(method = "lm", formula = y ~ x) +
+    theme_light() +
+    labs(title = str_c("Prop change non white ~ distance to freeway \n(cutoff = ", 
+                       cutoff, " mile)"))
+```
+```{r p-viz-loess}
+# use local polynomial regression to identify trends in demographics/distance
+# gradient using distance to i105 -- weight census block groups by total
+# occupied units
+
+cutoff <- 2
+
+pviz_loess <- county %>%
+  select(geoid.2000, distance, white.1990, white.2000,
+         population.1990, population.2000) %>%
+  filter(distance < cutoff * mile)
+
+# lpr percent white 1990 ~ distance to i105 weighted by population
+
+plpr_1990 <- pviz_loess %>% 
+  select(distance, white.1990, population.1990) %>% 
+  loess(data = ., formula = white.1990 ~ distance, weights = population.1990,
+        span = 0.75)
+
+plpr_preds_1990 <- predict(plpr_1990, pviz_loess$distance, se = T) %>% 
+  as_tibble() %>% 
+  mutate(year = "1990",
+         distance = pviz_loess$distance)
+
+# lpr percent white 2000 ~ distance to i105 weighted by population
+
+plpr_2000 <- pviz_loess %>% 
+  select(distance, white.2000, population.2000) %>% 
+  loess(data = ., formula = white.2000 ~ distance, weights = population.2000,
+        span = 0.75)
+
+plpr_preds_2000 <- predict(plpr_2000, pviz_loess$distance, se = T) %>% 
+  as_tibble() %>% 
+  mutate(year = "2000",
+         distance = pviz_loess$distance)
+
+# combine lpr predictions to plot median value 1990/2000 ~ distance to nearest
+# i105 on ramp
+
+plpr_preds_joined <- rbind(plpr_preds_1990, plpr_preds_2000) 
+
+plpr_preds_joined %>% 
+  ggplot(aes(x = distance, color = year, fill = year)) +
+    geom_line(aes(y = fit)) +
+    geom_ribbon(aes(ymax = fit + (1.96 * se.fit), ymin = fit - (1.96 * se.fit)), 
+                alpha = 0.25, color = NA) +
+    theme_light() +
+    labs(x = "Distance", y = "Prop white", 
+         title = str_c("Loess: prop white ~ distance i105 (cutoff: ", cutoff, 
+                       " mile)"))
+  
+```
+
+```{r p-discontinuity, eval=FALSE}
+treatment_zone <- 1500
+cutoff <- 2
+
+# plot percent white ~ distance using discontinuity to test if there's a
+# definable "treatment" zone
+
+pviz_disc <- county %>% 
+  mutate(treatment = distance < treatment_zone,
+         non_white.1990 = 1 - white.1990, 
+         non_white.2000 = 1 - white.2000,
+         change_non_white = prop_change(non_white.1990, non_white.2000)) %>% 
+  select(geoid.2000, distance, non_white.1990, non_white.2000, change_non_white, 
+         treatment) %>% 
+  pivot_longer(non_white.1990:non_white.2000, names_to = "series", 
+               values_to = "values")
+  
+ggplot() +
+  geom_smooth(data = pviz_disc %>% 
+                filter(distance < mile * cutoff, str_detect(series, "1990")),
+              aes(x = distance, y = values, group = treatment, color = series),
+              method = "lm", formula = y ~ x) +
+  geom_smooth(data = pviz_disc %>% 
+                  filter(distance < mile * cutoff, str_detect(series, "2000")),
+              aes(x = distance, y = values, group = treatment, color = series),
+              method = "lm", formula = y ~ x) +
+  geom_vline(xintercept = treatment_zone, lty = "dashed") +
+  theme_light() +
+  labs(title = str_c("Prop change non white ~ distance to freeway \n(cutoff = ", 
+                     cutoff, " mile, treatment = ", treatment_zone, ")"))
+```
+
+```{r model-data}
+# join and clean data for modeling; calculate percent change from 1990 to 2000
+# for variables of interest
+
+model_on_ramps <- hviz_2 %>% 
+  ungroup() %>% 
+  filter(series == "on") %>% 
+  select(geoid.2000, values) %>% 
+  rename(distance_on = values)
+
+model_data <- county %>% 
+  left_join(model_on_ramps, by = "geoid.2000") %>% 
+  mutate(change_value = prop_change(median_value.1990, median_value.2000),
+         change_rent = prop_change(median_rent.1990, median_rent.2000),
+         change_occupied = prop_change(occupied_units.1990, occupied_units.2000),
+         change_owner_occupied = prop_change(owner_occupied.1990, owner_occupied.2000),
+         change_renter_occupied = prop_change(renter_occupied.1990, renter_occupied.2000),
+         
+         change_white = prop_change(white.1990, white.2000),
+         change_black = prop_change(black.1990, black.2000),
+         change_hispanic = prop_change(hispanic.1990, hispanic.2000),
+         change_asian = prop_change(asian.1990, asian.2000),
+         
+         change_white_owner = prop_change(white_owner_occupied.1990,
+                                          white_owner_occupied.2000),
+         change_black_owner = prop_change(black_owner_occupied.1990,
+                                          black_owner_occupied.2000),
+         change_asian_owner = prop_change(asian_owner_occupied.1990,
+                                          asian_owner_occupied.2000),
+         change_hispanic_owner = prop_change(hispanic_owner_occupied.1990,
+                                             hispanic_owner_occupied.2000),
+         
+         change_white_renter = prop_change(white_renter_occupied.1990,
+                                           white_renter_occupied.2000),
+         change_black_renter = prop_change(black_renter_occupied.1990,
+                                           black_renter_occupied.2000),
+         change_hispanic_renter = prop_change(hispanic_renter_occupied.1990,
+                                             hispanic_renter_occupied.2000)
+         
+         )
+
+saveRDS(model_data, "model_data.RDS")
+```
+
+```{r model-prop-change, eval=TRUE}
+model_data <- readRDS("model_data.RDS") %>% 
+  filter(if_all(.cols = everything(), ~ is.infinite(.) == F)) %>% 
+  drop_na()
+
+control_vars <- c("distance_shoreline",
+                  "on_east",
+                  "on_west",
+                  "off_east",
+                  "off_west",
+                  
+                  "change_occupied",
+                  "change_owner_occupied",
+                  "change_renter_occupied",
+                  
+                  "change_white",
+                  "change_black",
+                  "change_hispanic",
+                  "change_asian",
+                  
+                  "change_white_owner",
+                  "change_black_owner",
+                  "change_hispanic_owner",
+                  "change_asian_owner",
+                  
+                  "change_white_renter",
+                  "change_black_renter",
+                  "change_hispanic_owner",
+                  "change_asian_owner")
+
+# simple model without controls: change in median home value ~ distances with
+# cutoff at 2 mi
+
+lm_value_distance <-
+  lm(formula = change_value ~ distance,
+    data = model_data %>% filter(distance < mile * 2))
+
+lm_value_on_ramps <-
+  lm(formula = change_value ~ on_east + on_west,
+    data = model_data %>% filter(distance < mile * 2))
+
+lm_value_off_ramps <-
+  lm(formula = change_value ~ off_east + off_west,
+    data = model_data %>% filter(distance < mile * 2))
+
+stargazer(lm_value_distance, lm_value_on_ramps, lm_value_off_ramps, type = "text")
+
+# simple model without controls: change in median home value ~ distances at
+# distance cutoffs 0.1 mi, 0.25 mi, 0.5 mi, 1 mi, 2 mi
+
+lm_value_1.10 <-
+  lm(formula = change_value ~ distance + on_east + on_west + off_east + off_west,
+    data = model_data %>% filter(distance < mile * 0.1))
+
+lm_value_1.25 <-
+  lm(formula = change_value ~ distance + on_east + on_west + off_east + off_west,
+    data = model_data %>% filter(distance < mile * 0.25))
+
+lm_value_1.50 <-
+  lm(formula = change_value ~ distance + on_east + on_west + off_east + off_west,
+    data = model_data %>% filter(distance < mile * 0.50))
+
+lm_value_1.100 <-
+  lm(formula = change_value ~ distance + on_east + on_west + off_east + off_west,
+    data = model_data %>% filter(distance < mile * 1))
+
+lm_value_1.200 <-
+  lm(formula = change_value ~ distance + on_east + on_west + off_east + off_west,
+    data = model_data %>% filter(distance < mile * 2))
+
+stargazer(lm_value_1.10, lm_value_1.25, lm_value_1.50, lm_value_1.100, 
+          lm_value_1.200, type = "text")
+
+# model without controls: change in median home value ~ distances + controls at
+# distance cutoffs 0.1 mi, 0.25 mi, 0.5 mi, 1 mi, 2 mi
+
+lm_value_2.10 <-
+  lm(formula = as.formula(paste("change_value ~ distance + ",
+                                paste(control_vars, collapse = " + "))),
+     data = model_data %>% filter(distance < mile * 0.1))
+
+lm_value_2.25 <-
+  lm(formula = as.formula(paste("change_value ~ distance + ", 
+                                paste(control_vars, collapse = " + "))),
+     data = model_data %>% filter(distance < mile * 0.25))
+
+lm_value_2.50 <-
+  lm(formula = as.formula(paste("change_value ~ distance + ", 
+                                paste(control_vars, collapse = " + "))),
+     data = model_data %>% filter(distance < mile * 0.5))
+
+lm_value_2.100 <-
+  lm(formula = as.formula(paste("change_value ~ distance + ", 
+                                paste(control_vars, collapse = " + "))),
+     data = model_data %>% filter(distance < mile * 1))
+
+lm_value_2.200 <-
+  lm(formula = as.formula(paste("change_value ~ distance + ",
+                                paste(control_vars, collapse = " + "))),
+     data = model_data %>% filter(distance < mile * 2))
+
+lm_value_poly <- 
+  lm(formula = as.formula(paste("change_value ~ poly(distance, 2) + ",
+                                paste(control_vars, collapse = " + "))),
+     data = model_data %>% filter(distance < mile * 2))
+
+stargazer(lm_value_2.10, lm_value_2.25, lm_value_2.50, lm_value_2.100, 
+          lm_value_2.200, type = "text", 
+          column.labels = c("0.1mi", "0.25mi", "0.5mi", "1mi", "2mi"),
+          header = F)
+
+# misc exploration
+
+lm_prop_hispanic <- lm(formula = change_hispanic ~ distance + change_occupied + 
+                         change_owner_occupied + change_renter_occupied, 
+                       data = model_data %>% filter(distance < mile * 2))
+
+lm_prop_white <- lm(formula = change_white ~ distance + change_occupied + 
+                         change_owner_occupied + change_renter_occupied, 
+                    data = model_data %>% filter(distance < mile * 2))
+
+lm_white_owner <- lm(formula = change_white_owner ~ distance + change_occupied + 
+                         change_owner_occupied + change_renter_occupied, 
+                    data = model_data %>% filter(distance < mile * 2))
+
+lm_owner <- lm(formula = change_owner_occupied ~ distance, 
+               data = model_data %>% filter(distance < mile * 2))
+
+lm_renter <- lm(formula = change_owner_occupied ~ distance, 
+               data = model_data %>% filter(distance < mile * 2))
+
+stargazer(lm_prop_hispanic, lm_prop_white, lm_owner, lm_white_owner, lm_renter, type = "text")
+```
+
+```{r did}
+# test difference in difference specifications. exploratory analysis didn't
+# indicate clear cutoff points to use to define "treatment" so DiD probably
+# isn't going to find anything
+
+control_vars_did <- c("change_occupied",
+                      "change_owner_occupied",
+                      "change_renter_occupied",
+                      
+                      "change_white",
+                      "change_black",
+                      "change_hispanic",
+                      "change_asian",
+                      
+                      "change_white_owner",
+                      "change_black_owner",
+                      "change_hispanic_owner",
+                      "change_asian_owner",
+                      
+                      "change_white_renter",
+                      "change_black_renter",
+                      "change_hispanic_owner",
+                      "change_asian_owner")
+
+did_data <- model_data %>% 
+  pivot_longer(cols = c(median_value.1990, median_value.2000), 
+               names_to = "year",
+               values_to = "value") %>% 
+  filter(distance < mile * 2) %>% 
+  mutate(post = ifelse(year == "median_value.2000", T, F))
+
+lm_did.1500 <- lm(formula = value ~ treatment + post + treatment:post, 
+                  data = did_data %>% 
+                    mutate(treatment = ifelse(distance < 1500, T, F)))
+
+lm_did.1750 <- lm(formula = value ~ treatment + post + treatment:post, 
+                  data = did_data %>% 
+                    mutate(treatment = ifelse(distance < 1750, T, F)))
+
+lm_did.2000 <- lm(formula = value ~ treatment + post + treatment:post, 
+                  data = did_data %>% 
+                    mutate(treatment = ifelse(distance < 2000, T, F)))
+
+stargazer(lm_did.1500, lm_did.1750, lm_did.2000, type = "text",
+          column.labels = c("1500m", "1750m", "2000m"))
+
+lm_did_2 <- lm(formula = as.formula(paste("value ~ treatment + post + treatment:post + ", 
+                                paste(control_vars_did, collapse = " + "))),
+               data = did_data)
+
+stargazer(lm_did, lm_did_2, type = "text")
+```
+
+

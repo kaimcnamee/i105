@@ -1,0 +1,635 @@
+---
+title: "gov 52 project research"
+author: "Kai McNamee"
+date: "2/1/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(leaflet)
+library(tidycensus)
+library(sp)
+library(sf)
+library(rgdal)
+library(geojsonio)
+library(jsonlite)
+library(httr)
+library(foreign)
+library(janitor)
+library(geosphere)
+library(stargazer)
+```
+
+```{r read-geometry}
+# i105: read freeway shapefile and subset data to include only lines for i105
+
+freeways_shape <- st_read("data/Master_Plan_of_Highways/")
+
+i105 <- freeways_shape %>% 
+  filter(NAMEA_ALF == "GLENN M ANDERSON FWY & TRANSIT") %>% 
+  st_set_crs("WGS84") %>% 
+  clean_names()
+
+saveRDS(i105, "i105.RDS")
+
+# block groups: read block group shapes from 2000 census
+
+c2000_block_groups <- get_decennial(geography = "block group", state = "06", county = "037", 
+                                    variables = c("population" = "P001001"),
+                                    geometry = T, year = 2000) %>% 
+  clean_names() %>% 
+  select(geoid, geometry) %>% 
+  st_transform(4326) 
+
+saveRDS(c2000_block_groups, "c2000_block_groups.RDS")
+
+# shoreline: read shoreline shape and clip to LA county shape
+
+la_county <- get_decennial(geography = "county", state = "06", county = "037", 
+                           variables = c("population" = "P001001"),
+                           geometry = T, year = 2000) %>% 
+  st_transform(4326)
+
+la_shoreline <- st_read("data/scal_shoreline/Socal_1998.shp") %>% 
+  st_transform(4326) %>% 
+  st_intersection(st_buffer(la_county, 100))
+
+saveRDS(la_shoreline, "la_shoreline.RDS")
+
+# read on/off ramp data from:
+# https://www.google.com/maps/d/u/0/edit?mid=16M0FcfC6HptZgBFsNDO8uN8R--eMuEmI&usp=sharing
+
+i105_ramps <- map_df(.x = c("on eastbound", "off eastbound", 
+                            "on westbound", "off westbound"), 
+                     ~st_read("data/i105_on_off.kml", layer = .))
+
+i105_ramps <- i105_ramps %>% 
+  clean_names() %>% 
+  separate(name, into = c("type", "seq", "direction"), sep = " ") %>% 
+  select(-description) %>% 
+  mutate(id = row_number(), .before = "type") 
+
+saveRDS(i105_ramps, "i105_ramps.RDS")
+```
+
+
+```{r read-1990-geometry}
+# census geometry: read census tract and block group shapefiles; extract
+# geometric centroids' longitude/latitude and calculate distance to i105
+# polyline (source: https://www.census.gov/geographies/mapping-files/time-series/geo/carto-boundary-file.1990.html)
+
+c1990_bg_shape <- st_read("data/bg06_d90_shp/") %>% clean_names()
+
+c1990_bg_shape <- c1990_bg_shape %>% 
+  
+  # st_centroid to extract longitude and lattitude from blockgroup polygons
+  
+  mutate(lng = map_dbl(geometry, ~st_centroid(.x)[[1]]), 
+         lat = map_dbl(geometry, ~st_centroid(.x)[[2]]),
+         
+         # convert coordinate pairs into st_point values. st_point takes 1
+         # coordinate pair per call -- loop through lng and lat with map2 x
+         # and y
+         
+         centroid_st = map2(.x = lng, .y = lat, ~st_point(c(.x, .y))),
+         
+         # convert st_point lists into sfc to assign WSG84 crs (crs must match
+         # i105 shape data for distance calculation)
+         
+         centroid_sfc = st_sfc(centroid_st, crs = "WGS84"))
+
+# st_distance creates distance matrix between all block group centroid points
+# and i105 polylines. add geoid's so geometry data can be joined with census
+# data later. filter for minimum distance
+
+distance_bg <- as_tibble(st_distance(c1990_bg_shape$centroid_sfc, i105$geometry)) %>% 
+  clean_names() %>% 
+  mutate(geoid = c1990_bg_shape$geoid, .before = v1) 
+
+distance_bg <- distance_bg %>% 
+  pivot_longer(v1:v18, names_to = "line", values_to = "distance") %>% 
+  group_by(geoid) %>% 
+  filter(distance == min(distance))
+
+# repeat process for tracts
+
+# note: tract geometry data doesn't include geoid. create geoid by combining
+# state fip code (2 digits), county code (3) digits, tractbase (4) and tractsuf
+# (NA or 2). resulting ids should all be 11 digits.
+
+c1990_tr_shape <- st_read("data/tr06_d90_shp/") %>% 
+  clean_names() %>% 
+  mutate(geoid = paste0(st, co, tractbase), .before = geometry,
+         
+         # replace tractsuf NA with 00
+         
+         geoid = ifelse(is.na(tractsuf), paste0(geoid, "00"), paste0(geoid, tractsuf)))
+  
+c1990_tr_shape <- c1990_tr_shape %>% 
+  mutate(lng = map_dbl(geometry, ~st_centroid(.x)[[1]]), 
+         lat = map_dbl(geometry, ~st_centroid(.x)[[2]]),
+         centroid_st = map2(.x = lng, .y = lat, ~st_point(c(.x, .y))),
+         centroid_sfc = st_sfc(centroid_st, crs = "WGS84"))
+
+distance_tract <- as_tibble(st_distance(c1990_tr_shape$centroid_sfc, i105$geometry)) %>% 
+  clean_names() %>% 
+  mutate(geoid = c1990_tr_shape$geoid, .before = v1) 
+
+distance_tract <- distance_tract %>% 
+  pivot_longer(v1:v18, names_to = "line", values_to = "distance") %>% 
+  group_by(geoid) %>%
+  filter(distance == min(distance))
+```
+
+```{r check-i105-1990-bg}
+# join block group geometry with distances to use as filter variable in map
+
+c1990_bg_shape_joined <- c1990_bg_shape %>% 
+  left_join(distance_bg, by = "geoid") %>% 
+  mutate(distance = as.numeric(distance))
+
+leaflet() %>% 
+  addProviderTiles(providers$CartoDB.Positron) %>% 
+  
+  # add i105 layer
+  
+  addPolylines(data = i105, stroke = TRUE, 
+              smoothFactor = 0.3, 
+              fillOpacity = 0) %>% 
+  
+  # add block group layer
+  
+  addPolygons(data = c1990_bg_shape_joined %>%
+                filter(distance < 3218.69),
+              weight = 0.5,
+              popup = ~ paste(geoid))
+  
+  # addMarkers(data = c1990_bg_shape, lng = c1990_bg_shape$lng, lat = c1990_bg_shape$lat)
+```
+
+```{r check-i105-1990-tract, eval=FALSE}
+# join tract geometry with distances to use as filter variable in map
+
+c1990_tr_shape_joined <- c1990_tr_shape %>% 
+  left_join(distance_tract, by = "geoid") %>% 
+  mutate(distance = as.numeric(distance))
+
+leaflet() %>% 
+  addProviderTiles(providers$CartoDB.Positron) %>% 
+  
+  # add i105 layer
+  
+  addPolylines(data = i105, stroke = TRUE, 
+              smoothFactor = 0.3, 
+              fillOpacity = 0) %>% 
+  
+  # add block group layer
+  
+  addPolygons(data = c1990_tr_shape_joined %>% 
+                filter(co == "037" & distance < 3218.69),
+              weight = 0.5)
+  
+  # addMarkers(data = c1990_bg_shape, lng = c1990_bg_shape$lng, lat = c1990_bg_shape$lat)
+```
+
+```{r read-1990-census}
+# read census tables to identify variables of interest
+
+ctables <- read.dbf("data/1990/tables.dbf") %>% clean_names()
+cstru <- read.dbf("data/1990/stf1stru.dbf") %>% clean_names()
+
+# potential variables of interest
+# segment STF18 has stuff related to home value
+# vars around H0090001 related to housing unit ownership
+
+# store and name demographic variables
+
+c1990_dem_vars <- c(
+  "population" = "p0010001",
+  "male" = "p0050001",
+  "female" = "p0050002",
+  "white" = "p0060001",
+  "black" = "p0060002",
+  "native" = "p0060003",
+  "asian" = "p0060004",
+  "other" = "p0060005",
+  "hispanic" = "p0080001"
+)
+
+c1990_young <- map_chr(.x = c(str_c(0, seq(1, 9, 1)), 10:14), ~str_c("p01100", .)) %>% 
+  setNames(as.character(ctables$text[c(88:101)]))
+
+c1990_old <- map_chr(.x = 27:31, ~str_c("p01100", .)) %>% 
+  setNames(as.character(ctables$text[c(114:118)]))
+
+# store and name housing variables
+
+c1990_housing_vars <-
+  map_chr(.x = c(paste0(0, seq(1, 9, 1)), 10:20),
+          ~ str_c("h02300", .)) %>%
+  setNames(as.character(ctables$text[c(1058:1077)]))
+
+c1990_housing_summary <- c("median_value" = "h023b001",
+                           "median_rent" = "h032b001")
+
+c1990_householder_vars <- c(
+  
+  # tenure (universe: occupied housing units)
+  
+  "occupied_units" = "h0020001",
+  "owner_occupied" = "h0030001",
+  "renter_occupied" = "h0030002",
+  
+  # race of householder (universe: occupied housing units)
+  
+  "white_householder" = "h0080001",
+  "black_householder" = "h0080002",
+  "native_householder" = "h0080003",
+  "asian_householder" = "h0080004",
+  "other_householder" = "h0080005",
+  "hispanic_householder" = "h0270002",
+  
+  # tenure by race of householder (universe: occupied housing units)
+  # owner occupied:
+  
+  "white_owner_occupied" = "h0090001",
+  "black_owner_occupied" = "h0090002",
+  "native_owner_occupied" = "h0090003",
+  "asian_owner_occupied" = "h0090004",
+  "other_owner_occupied" = "h0090005",
+  
+  "white_hispanic_owner" = "h0110001",
+  "black_hispanic_owner" = "h0110002",
+  "native_hispanic_owner" = "h0110003",
+  "asian_hispanic_owner" = "h0110004",
+  "other_hispanic_owner" = "h0110005",
+  
+  # renter occupied:
+  
+  "white_renter_occupied" = "h0090006",
+  "black_renter_occupied" = "h0090007",
+  "native_renter_occupied" = "h0090008",
+  "asian_renter_occupied" = "h0090009",
+  "other_renter_occupied" = "h0090010",
+  
+  "white_hispanic_renter" = "h0110006",
+  "black_hispanic_renter" = "h0110007",
+  "native_hispanic_renter" = "h0110008",
+  "asian_hispanic_renter" = "h0110009",
+  "other_hispanic_renter" = "h0110010"
+)
+
+la_county_code <- "037"
+tract <- "140"
+block_group <- "150"
+
+# exploratory: rows for every stf1a1 column correspond to summary levels of
+# census data, and each file (from stf1a0 to stf1a9) includes a different set of
+# variables for the same summary levels -- data needs to be joined with a column
+# bind
+
+stf1a0 <- read.dbf("data/1990/stf1a0ca.dbf") %>%
+  clean_names() %>%
+  filter(sumlev == block_group)
+
+stf1a1 <- read.dbf("data/1990/stf1a1ca.dbf") %>%
+  clean_names() %>%
+  filter(cnty == la_county_code)
+
+stf1a8 <- read.dbf("data/1990/stf1a8ca.dbf") %>%
+  clean_names() %>%
+  filter(cnty == la_county_code)
+
+# use map() to read .dbf files from stf1a0 to stf1a9; reduce(left_join()) to
+# combine the resulting data frames
+
+c1990 <- map(.x = 0:9, ~read.dbf(file = str_c("data/1990/stf1a", .,"ca.dbf"))) %>% 
+  reduce(left_join, by = c("SUMLEV", "LOGRECNU", "BLCKGR", "TRACTBNA", "CNTY", 
+                           "COUSUBFP", "PLACEFP", "STATEFP")) %>% 
+  clean_names()
+```
+
+```{r 1990-bg-join}
+# join block group geometry with block group census data, left_join by matching
+# geoids
+
+c1990_bg_data <- c1990 %>% 
+  filter(sumlev == block_group) %>% 
+  
+  # filter by sumlev == block_group and clean up geoids. Note: geoids for
+  # blockgroups should always be 12 digits: state (2) + county (3) + tractbna
+  # (6, add 00 if 4) + blckgrp (1)
+  
+  mutate(tractbna = ifelse(str_length(tractbna) == 4, paste0(tractbna, "00"), 
+                           paste(tractbna)),
+         geoid = paste0(statefp, cnty, tractbna, blckgr), .before = fileid) %>%  
+  left_join(distance_bg, by = "geoid") %>%
+  select(-(fileid:spflag),-line) %>%
+  relocate(distance, .before = p0010001)
+  
+# create filter vector and map data to visually confirm geoid cleaning and join
+# worked correctly
+
+bg_filter <- c1990_bg_data %>% 
+  filter(as.numeric(distance) < 3218.69) %>% 
+  pull(geoid)
+
+# visually confirm geoids in the filter vector are correct
+
+leaflet() %>% 
+  addProviderTiles(providers$CartoDB.Positron) %>% 
+  addPolylines(data = i105, stroke = TRUE, 
+              smoothFactor = 0.3, 
+              fillOpacity = 0) %>% 
+  addPolygons(data = c1990_bg_shape_joined %>% 
+                filter(geoid %in% bg_filter),
+              weight = 0.5,
+              popup = ~ paste(geoid))
+
+nrow(c1990_bg_data %>% filter(as.numeric(distance) < 3218.69))
+
+# join worked correctly, use c1990_bg_data dataframe to analyze block group level
+# data and filter by distance to I105
+```
+
+```{r 1990-tract-join, eval=FALSE}
+# join tract data with distance calculations by matching geoids
+
+c1990_tr_data <- c1990 %>% 
+  filter(sumlev == tract) %>% 
+  
+  # filter by sumlev == tract and clean up geoids. Note: geoids for tracts
+  # should always be 11 digits: state (2) + county (3) + tractbna (6, add 00 if
+  # 4)
+  
+  mutate(geoid = paste0(statefp, cnty, tractbna), .before = fileid,
+         geoid = ifelse(str_length(geoid) == 11, geoid, paste0(geoid, "00"))) %>% 
+  left_join(distance_tract, by = "geoid") %>% 
+  select(-(fileid:spflag), -line) %>% 
+  relocate(distance, .before = p0010001) %>% 
+  drop_na(distance)
+
+# create filter vector and map data to visually confirm geoid cleaning and join
+# worked correctly
+
+tract_filter <- c1990_tr_data %>% 
+  filter(as.numeric(distance) < (3218.69 * 1)) %>% 
+  pull(geoid)
+
+leaflet() %>% 
+  addProviderTiles(providers$CartoDB.Positron) %>% 
+  addPolylines(data = i105, stroke = TRUE, 
+              smoothFactor = 0.3, 
+              fillOpacity = 0) %>% 
+  addPolygons(data = c1990_tr_shape_joined %>% 
+                filter(geoid %in% tract_filter),
+              weight = 0.5)
+
+# join worked correctly, use c1990_tr_data dataframe to analyze census tract
+# level data and filter by distance to I105
+```
+
+```{r read-2000-census}
+# load variable codebooks for summary file 1 and 3
+
+sf1_2000 <- load_variables(2000, "sf1")
+sf3_2000 <- load_variables(2000, "sf3")
+
+# note: get_decennial throws an error when inputting vector of variables that
+# span multiple summary files (ex: demographic variables are in sf1 while
+# housing variables are in sf3) -- read sf1 and sf3 variables separately
+
+c2000_dem_vars <- c(
+  "population" = "P001001",
+  "male" = "P012002",
+  "female" = "P012026",
+  "white" = "P003003",
+  "black" = "P003004",
+  "native" = "P003005",
+  "asian" = "P003006",
+  "other" = "P003008",
+  "hispanic" = "P004002"
+)
+
+c2000_young_male <- map_chr(.x = seq(3, 7, 1),  ~str_c("P01200", .)) %>% 
+  setNames(c("male_under_5", "male_5_9", "male_10_14", "male_15_17", "male_18_19"))
+
+c2000_old_male <- map_chr(.x = seq(20, 25, 1), ~str_c("P0120", .)) %>% 
+  setNames(c("male_65_66", "male_67_69", "male_70_74", "male_75_79", "male_80_84", "male_85"))
+
+c2000_young_female <- map_chr(.x = seq(27, 31, 1), ~str_c("P0120", .)) %>% 
+  setNames(c("female_under_5", "female_5_9", "female_10_14", "female_15_17", "female_18_19"))
+
+c2000_old_female <- map_chr(.x = seq(44, 49, 1), ~str_c("P0120", .)) %>% 
+  setNames(c("female_65_66", "female_67_69", "female_70_74", "female_75_79", "female_80_84", "female_85"))
+
+# housing value summary
+
+c2000_housing_sum <- c(
+  "median_value" = "H075001",
+  "median_rent" = "H056001"
+)
+
+c2000_householder_vars <- c(
+  
+  # tenure
+  
+  "occupied_units" = "H003002",
+  "owner_occupied" = "H004002",
+  "renter_occupied" = "H004003",
+  
+  # race of householder
+  
+  "white_householder" = "H006002",
+  "black_householder" = "H006003",
+  "native_householder" = "H006004",
+  "asian_householder" = "H006005",
+  "hi_pi_householder" = "H006006",
+  "other_householder" = "H006007",
+  
+  # tenure by race of householder
+  # owner occupied
+  
+  "white_owner_occupied" = "H014003",
+  "black_owner_occupied" = "H014004",
+  "native_owner_occupied" = "H014005",
+  "asian_owner_occupied" = "H014006",
+  "hi_pi_owner_occupied" = "H014007",
+  "other_owner_occupied" = "H014008",
+
+  # renter occupied
+  
+  "white_renter_occupied" = "H014011",
+  "black_renter_occupied" = "H014012",
+  "native_renter_occupied" = "H014013",
+  "asian_renter_occupied" = "H014014",
+  "hi_pi_renter_occupied" = "H014015",
+  "other_renter_occupied" = "H014016"
+)
+
+c2000_hispanic_tenure <- c("hispanic_householder" = "H010010",
+                           "hispanic_owner_occupied" = "H012002",
+                           "hispanic_renter_occupied" = "H012003")
+
+# housing value ranges
+
+# c2000_housing_vars <-
+#   map_chr(.x = c(paste0(0, seq(2, 9, 1)), 10:24),
+#           ~ str_c("H0740", .)) %>%
+#   setNames(as.character(sf3_2000$label[c(1006:1025)]))
+
+# read 2000 census summary file 1 data using tidycensus's get_deccenial()
+
+c2000_bg_sf1 <- get_decennial(
+  geography = "block group",
+  state = "06",
+  county = "037",
+  variables = c(c2000_dem_vars, c2000_young_male, c2000_old_male, 
+                c2000_young_female, c2000_old_female, c2000_householder_vars),
+  geometry = T,
+  year = 2000
+)
+
+# read 2000 census summary file 3 data
+
+c2000_bg_sf3 <- get_decennial(
+  geography = "block group",
+  state = "06",
+  county = "037",
+  sumfile = "sf3",
+  variables = c(c2000_housing_sum, c2000_hispanic_tenure),
+  geometry = F,
+  year = 2000
+)
+
+# join 2000 bg level demographic and housing data
+
+c2000_bg_data <- c2000_bg_sf1 %>% 
+  pivot_wider(names_from = variable, values_from = value) %>% 
+  inner_join(c2000_bg_sf3 %>% 
+               pivot_wider(names_from = variable,
+                           values_from = value),
+             by = c("GEOID", "NAME")) %>% 
+  clean_names() %>% 
+  select(-name) %>% 
+  mutate(lng = map_dbl(geometry, ~st_centroid(.x)[[1]]), 
+         lat = map_dbl(geometry, ~st_centroid(.x)[[2]]),
+         centroid_st = map2(.x = lng, .y = lat, ~st_point(c(.x, .y))),
+         centroid_sfc = st_sfc(centroid_st, crs = "WGS84"))
+
+# calculate distances between block group centroids and i105 lines
+
+distance_bg_2000 <- as_tibble(st_distance(c2000_bg_data$centroid_sfc, i105$geometry)) %>% 
+  clean_names() %>% 
+  mutate(geoid = c2000_bg_data$geoid, .before = v1) 
+
+distance_bg_2000 <- distance_bg_2000 %>% 
+  pivot_longer(v1:v18, names_to = "line", values_to = "distance") %>% 
+  group_by(geoid) %>% 
+  filter(distance == min(distance))
+
+c2000_bg_data <- c2000_bg_data %>% 
+  left_join(distance_bg_2000, by = "geoid") %>%
+  select(-line) %>%
+  relocate(distance, .before = population)
+
+# block groups within 2 miles of i105 in 2000: 624
+# block groups within 2 miles of i105 in 1990: 608
+
+nrow(c2000_bg_data %>% filter(as.numeric(distance) < 3218.69))
+
+```
+
+```{r exit-distances}
+# calculate minimum distances between block group centroids and westbound on/off
+# ramps as well as eastbound on/off ramps
+
+leaflet() %>% 
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addPolylines(data = i105) %>% 
+  addCircleMarkers(data = i105_ramps, radius = 5, stroke = NA)
+
+# create distance matrix with st_distance; clean data and join with 2020 census
+# data
+
+distance_exits <- as_tibble(st_distance(c2000_bg_data$centroid_sfc, i105_ramps$geometry)) %>% 
+  clean_names()
+
+names(distance_exits) <- as.character(seq(1, 56, 1))
+
+distance_exits <- distance_exits %>% 
+  mutate(geoid = c2000_bg_data$geoid, .before = "1") %>% 
+  pivot_longer(cols = `1`:`56`, names_to = "id", values_to = "distance") %>% 
+  mutate(id = as.numeric(id)) %>% 
+  left_join(i105_ramps %>% st_drop_geometry(), by = "id") %>% 
+  mutate(type_dir = str_c(type, "_", direction)) %>% 
+  group_by(geoid, type_dir) %>% 
+  arrange(distance) %>% 
+  slice(1) %>% 
+  select(geoid, distance, type_dir) %>% 
+  pivot_wider(names_from = type_dir, values_from = distance)
+
+c2000_bg_data <- c2000_bg_data %>% 
+  left_join(distance_exits, by = "geoid") %>% 
+  relocate(off_east:on_west, .after = "distance")
+```
+
+```{r shoreline-distances}
+# calculate minimum distances between block group centroids and shoreline
+
+distance_shoreline <- as_tibble(st_distance(c2000_bg_data$centroid_sfc, 
+                                            la_shoreline$geometry)) %>% 
+  clean_names()
+
+distance_shoreline <- distance_shoreline %>% 
+  mutate(geoid = c2000_bg_data$geoid, .before = "v1") %>% 
+  pivot_longer(cols = v1:v3708, names_to = "id", values_to = "distance_shoreline") %>%
+  group_by(geoid) %>% 
+  arrange(distance_shoreline) %>% 
+  slice(1) %>% 
+  select(-id)
+
+c2000_bg_data <- c2000_bg_data %>% 
+  left_join(distance_shoreline, by = "geoid") %>% 
+  relocate(distance_shoreline, .after = "distance")
+
+leaflet() %>% 
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addPolygons(data = la_county, fillOpacity = 0.1, weight = 0.1) %>%
+  addPolylines(data = i105) %>%
+  addCircleMarkers(data = i105_ramps, radius = 5, stroke = NA) %>%
+  addPolylines(data = la_shoreline) 
+```
+
+
+```{r save-cleaned-data}
+# save cleaned dataframes combining census data and geography data
+
+c1990_bg_out <- c1990_bg_data %>% 
+  left_join(c1990_bg_shape_joined %>% select(geoid, geometry), by = "geoid") %>% 
+  relocate(geometry, .after = "geoid") %>% 
+  select(geoid, distance, geometry, 
+         all_of(c(c1990_dem_vars, 
+                  c1990_young,
+                  c1990_old,
+                  c1990_housing_summary,
+                  c1990_householder_vars))) %>% 
+  clean_names()
+
+st_geometry(c1990_bg_out) <- c1990_bg_out$geometry
+st_crs(c1990_bg_out) <- 4326
+
+c2000_bg_out <- c2000_bg_data %>% 
+  relocate(geometry, .after = "geoid") %>% 
+  select(!(lng:centroid_sfc))
+
+st_geometry(c2000_bg_out) <- c2000_bg_out$geometry
+
+c2000_bg_out <- c2000_bg_out %>% st_transform(4326)
+
+saveRDS(c1990_bg_out, "c1990_bg_out.RDS")
+saveRDS(c2000_bg_out, "c2000_bg_out.RDS")
+```
+
